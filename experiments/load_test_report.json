@@ -1,0 +1,13 @@
+{
+  "n_requests": 200,
+  "concurrency": 4,
+  "total_time_s": 0.2,
+  "throughput_rps": 1005.27,
+  "error_rate": 1.0,
+  "latency": {
+    "p50_ms": null,
+    "p95_ms": null,
+    "p99_ms": null,
+    "mean_ms": null
+  }
+}

@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/*.jsonl
+data/splits.lock
+models/
+experiments/mlruns/
+*.pt
+*.bin
+*.safetensors
