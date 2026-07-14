@@ -59,12 +59,12 @@ for i, clause in enumerate(CLAUSE_TYPES):
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
 
 HPARAM_GRID = [
-    {"lr": 2e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1},
-    {"lr": 2e-5, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1},
-    {"lr": 3e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.06},
-    {"lr": 3e-5, "batch_size": 16, "epochs": 3, "warmup_ratio": 0.06},
+    {"lr": 1e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1},
     {"lr": 1e-5, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1},
-    {"lr": 4e-5, "batch_size": 8,  "epochs": 2, "warmup_ratio": 0.1},
+    {"lr": 2e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1},
+    {"lr": 2e-5, "batch_size": 16, "epochs": 3, "warmup_ratio": 0.1},
+    {"lr": 5e-6, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1},
+    {"lr": 3e-5, "batch_size": 8,  "epochs": 2, "warmup_ratio": 0.15},
 ]
 
 
@@ -194,31 +194,52 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
             model.train()
             total_loss = 0.0
             n_valid_steps = 0
-            n_skipped = 0
+            n_skipped_loss = 0
+            n_skipped_grad = 0
             for batch in train_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
                 out = model(**batch)
                 loss = out.loss
 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    n_skipped += 1
+                    n_skipped_loss += 1
                     optimizer.zero_grad()
                     continue
 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                # Critical: DeBERTa-v3's disentangled attention can produce a
+                # finite loss but NaN/Inf gradients during backward(). If we
+                # call optimizer.step() here, NaN propagates into the model
+                # weights permanently -- every subsequent batch becomes NaN
+                # from then on, even with a completely different sequence.
+                # Skip the step entirely rather than let this happen.
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    n_skipped_grad += 1
+                    optimizer.zero_grad()
+                    continue
+
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 total_loss += loss.item()
                 n_valid_steps += 1
 
-            if n_skipped > 0:
-                print(f"  [WARNING] Skipped {n_skipped}/{len(train_loader)} batches with NaN/Inf loss")
+            total_skipped = n_skipped_loss + n_skipped_grad
+            if total_skipped > 0:
+                print(f"  [WARNING] Skipped {total_skipped}/{len(train_loader)} batches "
+                      f"({n_skipped_loss} NaN loss, {n_skipped_grad} NaN gradient)")
 
             avg_loss = total_loss / n_valid_steps if n_valid_steps > 0 else float("nan")
             mlflow.log_metric("train_loss", avg_loss, step=epoch)
-            mlflow.log_metric("n_skipped_batches", n_skipped, step=epoch)
+            mlflow.log_metric("n_skipped_loss", n_skipped_loss, step=epoch)
+            mlflow.log_metric("n_skipped_grad", n_skipped_grad, step=epoch)
+
+            if n_valid_steps == 0:
+                print(f"  [ERROR] Zero valid steps in epoch {epoch+1} -- "
+                      f"this config is fundamentally unstable, moving to next config.")
+                break
 
             model.eval()
             all_preds, all_labels = [], []
