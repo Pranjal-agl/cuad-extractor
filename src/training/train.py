@@ -64,7 +64,7 @@ HPARAM_GRID = [
     {"lr": 3e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.06},
     {"lr": 3e-5, "batch_size": 16, "epochs": 3, "warmup_ratio": 0.06},
     {"lr": 1e-5, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1},
-    {"lr": 5e-5, "batch_size": 8,  "epochs": 2, "warmup_ratio": 0.06},
+    {"lr": 4e-5, "batch_size": 8,  "epochs": 2, "warmup_ratio": 0.1},
 ]
 
 
@@ -165,6 +165,8 @@ def compute_f1(preds: list[int], labels: list[int]) -> dict[str, float]:
 def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Using device: {device}"
+          + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
     model = AutoModelForTokenClassification.from_pretrained(
         MODEL_NAME, num_labels=len(LABEL2ID),
@@ -191,19 +193,32 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
         for epoch in range(config["epochs"]):
             model.train()
             total_loss = 0.0
+            n_valid_steps = 0
+            n_skipped = 0
             for batch in train_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
                 out = model(**batch)
                 loss = out.loss
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    n_skipped += 1
+                    optimizer.zero_grad()
+                    continue
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 total_loss += loss.item()
+                n_valid_steps += 1
 
-            avg_loss = total_loss / len(train_loader)
+            if n_skipped > 0:
+                print(f"  [WARNING] Skipped {n_skipped}/{len(train_loader)} batches with NaN/Inf loss")
+
+            avg_loss = total_loss / n_valid_steps if n_valid_steps > 0 else float("nan")
             mlflow.log_metric("train_loss", avg_loss, step=epoch)
+            mlflow.log_metric("n_skipped_batches", n_skipped, step=epoch)
 
             model.eval()
             all_preds, all_labels = [], []
