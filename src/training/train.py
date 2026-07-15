@@ -173,8 +173,14 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
         id2label=ID2LABEL, label2id=LABEL2ID, ignore_mismatched_sizes=True,
     ).to(device)
 
-    train_ds = CUADDataset(train_examples, tokenizer)
-    val_ds = CUADDataset(val_examples, tokenizer)
+    # max_length=384 keeps sequences clear of the 512 boundary where
+    # DeBERTa-v2/v3's relative-position bucket lookup in
+    # disentangled_attention_bias can index out of range and silently
+    # read garbage (NaN) on CUDA instead of raising. This is the actual
+    # source of the NaN pattern -- it happens identically at every LR
+    # we tried, which rules out an optimizer/precision cause.
+    train_ds = CUADDataset(train_examples, tokenizer, max_length=384)
+    val_ds = CUADDataset(val_examples, tokenizer, max_length=384)
     collator = DataCollatorForTokenClassification(tokenizer)
 
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, collate_fn=collator)
@@ -288,6 +294,11 @@ def main():
         val_f1, model_path = train_one_config(config, train_examples, val_examples, tokenizer, run_name)
         results.append({"config": config, "val_f1": val_f1, "model_path": str(model_path), "run_name": run_name})
         print(f"  Best val macro F1: {val_f1:.4f}")
+
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     best = max(results, key=lambda x: x["val_f1"])
     print(f"\nBest config: {best['run_name']}  val_macro_f1={best['val_f1']:.4f}")
