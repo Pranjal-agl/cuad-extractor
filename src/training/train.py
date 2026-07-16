@@ -17,6 +17,9 @@ REPRODUCIBILITY
 Seed is set for Python, NumPy, and PyTorch at the start of every run.
 """
 
+import os
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+
 import json
 import random
 from pathlib import Path
@@ -204,6 +207,30 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
             n_skipped_grad = 0
             for batch in train_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
+
+                # Sanity-check indices BEFORE the forward pass. An out-of-range
+                # input_id (embedding lookup) or label (loss target) causes an
+                # async CUDA illegal-memory-access that does not raise cleanly --
+                # it silently corrupts the CUDA context, and every op after that
+                # returns NaN/garbage for the rest of the process, regardless of
+                # LR, batch size, or model version. That matches this run's
+                # symptoms exactly, so we check explicitly rather than guess again.
+                vocab_size = model.config.vocab_size
+                bad_ids = batch["input_ids"][(batch["input_ids"] < 0) | (batch["input_ids"] >= vocab_size)]
+                if bad_ids.numel() > 0:
+                    raise ValueError(
+                        f"input_ids out of range for vocab_size={vocab_size}: "
+                        f"found values {bad_ids.unique().tolist()[:10]}"
+                    )
+                label_vals = batch["labels"]
+                valid_label_mask = (label_vals == -100) | ((label_vals >= 0) & (label_vals < len(LABEL2ID)))
+                if not torch.all(valid_label_mask):
+                    bad_labels = label_vals[~valid_label_mask]
+                    raise ValueError(
+                        f"labels out of range for num_labels={len(LABEL2ID)}: "
+                        f"found values {bad_labels.unique().tolist()[:10]}"
+                    )
+
                 out = model(**batch)
                 loss = out.loss
 
