@@ -176,6 +176,33 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
         id2label=ID2LABEL, label2id=LABEL2ID, ignore_mismatched_sizes=True,
     ).to(device)
 
+    # Diagnostic: report the FIRST module whose output contains NaN/Inf, once,
+    # then remove itself. This turns "loss is NaN" into "layer X produced NaN"
+    # so we stop guessing and see exactly where it originates (pretrained
+    # embeddings, a specific encoder layer, or the classifier head).
+    _nan_reported = {"done": False}
+    _hook_handles = []
+
+    def _make_hook(name):
+        def _hook(module, inputs, output):
+            if _nan_reported["done"]:
+                return
+            t = output[0] if isinstance(output, tuple) else output
+            if torch.is_tensor(t) and (torch.isnan(t).any() or torch.isinf(t).any()):
+                _nan_reported["done"] = True
+                print(f"  [NAN-LOCALIZE] First NaN/Inf appeared in module: {name}")
+                print(f"    output stats: min={t[~torch.isnan(t)].min().item() if (~torch.isnan(t)).any() else 'all-nan'} "
+                      f"max={t[~torch.isnan(t)].max().item() if (~torch.isnan(t)).any() else 'all-nan'} "
+                      f"nan_count={torch.isnan(t).sum().item()} inf_count={torch.isinf(t).sum().item()}")
+                for h in _hook_handles:
+                    h.remove()
+        return _hook
+
+    for name, module in model.named_modules():
+        if name:  # skip the top-level module itself
+            _hook_handles.append(module.register_forward_hook(_make_hook(name)))
+
+
     # max_length=384 keeps sequences clear of the 512 boundary where
     # DeBERTa-v2/v3's relative-position bucket lookup in
     # disentangled_attention_bias can index out of range and silently
@@ -189,7 +216,13 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, collate_fn=collator)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"] * 2, shuffle=False, collate_fn=collator)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=0.01)
+    # DeBERTa-v3's gradient-disentangled embedding sharing produces very small
+    # gradients for some parameters early in training. With AdamW's default
+    # eps=1e-8, the adaptive step size (lr / (sqrt(v) + eps)) can spike for
+    # those parameters, which is consistent with "one fine step, then every
+    # subsequent forward pass NaN" regardless of learning rate. Using eps=1e-6
+    # is the documented stability fix for fine-tuning this model family.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=0.01, eps=1e-6)
     total_steps = len(train_loader) * config["epochs"]
     warmup_steps = int(total_steps * config["warmup_ratio"])
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
