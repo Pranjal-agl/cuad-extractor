@@ -53,10 +53,10 @@ def load_4bit_model(model_path: Path):
     return model
 
 
-def measure_latency(model, tokenizer, text, n_warmup=N_WARMUP, n_timing=N_TIMING, device="cpu"):
+def measure_latency(model, tokenizer, text, n_warmup=N_WARMUP, n_timing=N_TIMING):
     inputs = tokenizer(text, return_tensors="pt", max_length=512, truncation=True, padding=False)
-    if not next(model.parameters()).is_cuda:
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+    model_device = next(model.parameters()).device
+    inputs = {k: v.to(model_device) for k, v in inputs.items()}
     with torch.no_grad():
         for _ in range(n_warmup):
             model(**inputs)
@@ -82,14 +82,14 @@ def measure_f1_on_val(model, tokenizer, n_samples=200):
     with open(val_path) as f:
         examples = [json.loads(l) for l in f if l.strip()][:n_samples]
 
-    device = "cuda" if next(model.parameters()).is_cuda else "cpu"
+    model_device = next(model.parameters()).device
     all_preds, all_labels = [], []
     model.eval()
     with torch.no_grad():
         for ex in examples:
             enc = tokenize_and_label(ex, tokenizer)
-            input_ids = torch.tensor([enc["input_ids"]]).to(device)
-            attention_mask = torch.tensor([enc["attention_mask"]]).to(device)
+            input_ids = torch.tensor([enc["input_ids"]]).to(model_device)
+            attention_mask = torch.tensor([enc["attention_mask"]]).to(model_device)
             out = model(input_ids=input_ids, attention_mask=attention_mask)
             preds = out.logits.argmax(dim=-1).cpu().numpy().flatten().tolist()
             all_preds.extend(preds)
@@ -116,7 +116,7 @@ def main():
 
     print("Loading FP32 model...")
     fp32_model = load_fp32_model(model_path).to(device)
-    fp32_latency = measure_latency(fp32_model, tokenizer, sample_text, device=device)
+    fp32_latency = measure_latency(fp32_model, tokenizer, sample_text)
     fp32_f1 = measure_f1_on_val(fp32_model, tokenizer)
     fp32_size = model_size_mb(model_path)
     print(f"FP32: F1={fp32_f1:.4f}  p99={fp32_latency['p99_ms']}ms  size={fp32_size}MB")

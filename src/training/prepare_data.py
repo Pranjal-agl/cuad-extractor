@@ -24,10 +24,10 @@ CLAUSE_TYPES = [
     "Termination For Convenience",
     "Renewal Term",
     "Non-Compete",
+    "Confidentiality Of Agreements",
+    "Indemnification",
     "Cap On Liability",
-    "Anti-Assignment",
-    "Audit Rights",
-    "Exclusivity",
+    "Assignment",
 ]
 
 SEED = 42

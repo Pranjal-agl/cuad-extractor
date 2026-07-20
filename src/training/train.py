@@ -323,6 +323,16 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
             for clause, f1 in f1s.items():
                 mlflow.log_metric(f"val_f1_{clause.replace(' ', '_')}", f1, step=epoch)
 
+            # Diagnostic: confirm whether the model is collapsing to all-"O"
+            # predictions (severe class imbalance) rather than there being a
+            # bug in the F1 computation itself.
+            from collections import Counter
+            pred_dist = Counter(ID2LABEL.get(p, "O") for p, l in zip(all_preds, all_labels) if l != -100)
+            true_dist = Counter(ID2LABEL.get(l, "O") for l in all_labels if l != -100)
+            n_pred_nonO = sum(v for k, v in pred_dist.items() if k != "O")
+            n_true_nonO = sum(v for k, v in true_dist.items() if k != "O")
+            print(f"  [LABEL-DIST] predicted non-O tokens: {n_pred_nonO} / true non-O tokens: {n_true_nonO}")
+
             print(f"  epoch {epoch+1}/{config['epochs']}  loss={avg_loss:.4f}  val_macro_f1={f1s['macro']:.4f}")
 
             if f1s["macro"] > best_val_f1:
