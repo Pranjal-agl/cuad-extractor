@@ -176,31 +176,6 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
         id2label=ID2LABEL, label2id=LABEL2ID, ignore_mismatched_sizes=True,
     ).to(device)
 
-    # Diagnostic: report the FIRST module whose output contains NaN/Inf, once,
-    # then remove itself. This turns "loss is NaN" into "layer X produced NaN"
-    # so we stop guessing and see exactly where it originates (pretrained
-    # embeddings, a specific encoder layer, or the classifier head).
-    _nan_reported = {"done": False}
-    _hook_handles = []
-
-    def _make_hook(name):
-        def _hook(module, inputs, output):
-            if _nan_reported["done"]:
-                return
-            t = output[0] if isinstance(output, tuple) else output
-            if torch.is_tensor(t) and (torch.isnan(t).any() or torch.isinf(t).any()):
-                _nan_reported["done"] = True
-                print(f"  [NAN-LOCALIZE] First NaN/Inf appeared in module: {name}")
-                print(f"    output stats: min={t[~torch.isnan(t)].min().item() if (~torch.isnan(t)).any() else 'all-nan'} "
-                      f"max={t[~torch.isnan(t)].max().item() if (~torch.isnan(t)).any() else 'all-nan'} "
-                      f"nan_count={torch.isnan(t).sum().item()} inf_count={torch.isinf(t).sum().item()}")
-                for h in _hook_handles:
-                    h.remove()
-        return _hook
-
-    for name, module in model.named_modules():
-        if name:  # skip the top-level module itself
-            _hook_handles.append(module.register_forward_hook(_make_hook(name)))
 
 
     # max_length=384 keeps sequences clear of the 512 boundary where
@@ -212,6 +187,24 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
     train_ds = CUADDataset(train_examples, tokenizer, max_length=384)
     val_ds = CUADDataset(val_examples, tokenizer, max_length=384)
     collator = DataCollatorForTokenClassification(tokenizer)
+
+    # The model was collapsing to all-"O" predictions: confirmed via
+    # [LABEL-DIST] diagnostics showing 0/14946 non-O tokens predicted across
+    # 3 full epochs while loss still dropped. This is because O vastly
+    # outnumbers B-/I- tokens (a short clause span inside a long context),
+    # and unweighted cross-entropy is minimized by ignoring the minority
+    # classes entirely. Compute inverse-frequency class weights from the
+    # actual training label distribution and use them explicitly.
+    label_counts = torch.zeros(len(LABEL2ID))
+    for enc in train_ds.encodings:
+        for lab in enc["labels"]:
+            if lab != -100:
+                label_counts[lab] += 1
+    label_counts = torch.clamp(label_counts, min=1)  # avoid div-by-zero for any unseen label
+    class_weights = (label_counts.sum() / (len(LABEL2ID) * label_counts)).to(device)
+    print(f"  Class weights (min={class_weights.min().item():.3f}, "
+          f"max={class_weights.max().item():.3f}, O weight={class_weights[LABEL2ID['O']].item():.3f})")
+    loss_fct = torch.nn.CrossEntropyLoss(weight=class_weights, ignore_index=-100)
 
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, collate_fn=collator)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"] * 2, shuffle=False, collate_fn=collator)
@@ -264,8 +257,11 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
                         f"found values {bad_labels.unique().tolist()[:10]}"
                     )
 
-                out = model(**batch)
-                loss = out.loss
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                )
+                loss = loss_fct(out.logits.view(-1, len(LABEL2ID)), batch["labels"].view(-1))
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     n_skipped_loss += 1
@@ -339,6 +335,14 @@ def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
                 best_val_f1 = f1s["macro"]
                 model.save_pretrained(model_path)
                 tokenizer.save_pretrained(model_path)
+
+        # Safety net: if val F1 never improved past 0 (e.g. every epoch
+        # collapsed), still save the final epoch's weights so downstream
+        # steps (quantize.py, evaluate.py) have a real checkpoint to load
+        # instead of crashing on a missing directory.
+        if not model_path.exists():
+            model.save_pretrained(model_path)
+            tokenizer.save_pretrained(model_path)
 
         mlflow.log_metric("best_val_macro_f1", best_val_f1)
         mlflow.log_param("model_path", str(model_path))
