@@ -61,8 +61,12 @@ def load_4bit_model(model_path: Path):
 
 def measure_latency(model, tokenizer, text, n_warmup=N_WARMUP, n_timing=N_TIMING, device="cpu"):
     inputs = tokenizer(text, return_tensors="pt", max_length=512, truncation=True, padding=False)
-    if not next(model.parameters()).is_cuda:
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+    # Tokenizer output is always on CPU. Move inputs to whatever device the
+    # model actually lives on -- the previous check here was inverted (it
+    # only moved inputs when the model was on CPU), which left inputs on CPU
+    # whenever the model was on CUDA and crashed on the embedding lookup.
+    model_device = next(model.parameters()).device
+    inputs = {k: v.to(model_device) for k, v in inputs.items()}
     with torch.no_grad():
         for _ in range(n_warmup):
             model(**inputs)
