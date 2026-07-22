@@ -46,14 +46,14 @@ def load_4bit_model(model_path: Path):
         load_in_4bit=True, bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.float16,
     )
-    # device_map="auto" requires the model class to define _no_split_modules,
-    # which DebertaV2ForTokenClassification does not implement -- this is a
-    # real gap in that model's HF integration, not something fixable via
-    # config. "auto" only matters for splitting across multiple devices
-    # anyway; a single explicit device works fine with bitsandbytes.
-    device_map = {"": 0} if torch.cuda.is_available() else "cpu"
+    # Do NOT pass device_map. Any device_map value (including an explicit
+    # {"": 0}) makes transformers call dispatch_model() afterward, which
+    # tries model.to(device) on an already-quantized model and crashes --
+    # bitsandbytes explicitly disallows .to() on 4-bit models. HF's own docs
+    # for single-GPU 4-bit loading omit device_map entirely; accelerate
+    # places the quantized model correctly without it.
     model = AutoModelForTokenClassification.from_pretrained(
-        model_path, quantization_config=bnb_config, device_map=device_map,
+        model_path, quantization_config=bnb_config,
     )
     model.eval()
     return model

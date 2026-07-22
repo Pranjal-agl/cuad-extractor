@@ -57,7 +57,7 @@ def load_model(use_quantized: bool = False):
             bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.float16,
         )
         model = AutoModelForTokenClassification.from_pretrained(
-            quant_path, quantization_config=bnb, device_map="auto"
+            quant_path, quantization_config=bnb,
         )
         tokenizer = AutoTokenizer.from_pretrained(quant_path)
     else:
