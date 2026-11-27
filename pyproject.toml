@@ -1,0 +1,18 @@
+[project]
+name = "cuad-extractor"
+version = "0.2.0"
+description = "Fine-tuned DeBERTa-v3 clause span extraction on CUAD"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["B008", "B905"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,138 +1,62 @@
 # Model Card: CUAD Clause Extractor
 
-## Model Description
+## Model description
 
-DeBERTa-v3-base fine-tuned on the Contract Understanding Atticus Dataset (CUAD)
-for extractive clause identification. Given a contract paragraph, the model
-identifies and extracts text spans corresponding to 8 clause types.
+DeBERTa-v3-base fine-tuned on the Contract Understanding Atticus Dataset (CUAD v1) for extractive clause identification. Given contract text of any length, the model tags character spans for 8 clause types and gives each span a confidence score.
 
-**Base model:** microsoft/deberta-v3-base  
-**Task:** Token classification (BIO tagging) for clause span extraction  
-**Dataset:** CUAD (theatticusproject/cuad-qa on HuggingFace)  
-**Clause types covered:** Governing Law, Termination For Convenience, Renewal Term,
-Non-Compete, Confidentiality Of Agreements, Indemnification, Cap On Liability, Assignment
-
----
+- **Base model:** `microsoft/deberta-v3-base` (184M parameters)
+- **Task:** token classification with BIO tags (17 labels), sliding-window inference (384 tokens, stride 128)
+- **Clause types:** Governing Law, Termination For Convenience, Renewal Term, Non-Compete, Cap On Liability, Anti-Assignment, Audit Rights, Exclusivity
+- **Training data:** CUAD v1 (510 US commercial contracts, 41 categories, expert-annotated), loaded from `dvgodoy/CUAD_v1_Contract_Understanding_clause_classification` (labels) and `dvgodoy/CUAD_v1_Contract_Understanding_PDF` (text)
+- **Intended use:** first-pass highlighting of candidate clauses for a human reviewer
+- **Out of scope:** legal advice, or unsupervised decisions about a contract's legal effect
 
 ## Training
 
-**Hyperparameter selection:** Grid search over 6 configurations (learning rate,
-batch size, epochs, warmup ratio). Best configuration selected by macro-averaged
-F1 on the validation set. Test set was evaluated exactly once, after selection.
+- **Examples:** one positive window per CUAD annotation (the clause plus ~512 characters on each side), and negative windows (0.5 per positive) drawn from contracts that contain no clause of the queried type. Every target-clause annotation overlapping a window is labelled.
+- **Split:** contract-level 70/15/15 (seed 42). All windows from one contract stay in one split. `data/splits.lock` fingerprints the test contracts, test examples and clause list, and every script verifies it before running.
+- **Objective:** class-weighted cross-entropy (inverse or square-root inverse frequency; chosen by the grid), AdamW (eps 1e-6), linear warm-up/decay, gradient clipping at 1.0, non-finite batches skipped.
+- **Selection:** grid search (7 configs) on span-level macro F1 on the validation split, the same metric reported on test. Test is evaluated once, after selection.
+- **Tracking:** all runs are in MLflow with hyperparameters, per-epoch metrics, git commit and checkpoint path.
 
-**Split strategy:** Contract-level split (70/15/15). All clauses from one contract
-stay in the same split, preventing the model from memorising boilerplate shared
-across contracts from the same company.
+## Evaluation
 
-**Reproducibility:** All runs use seed=42 set across Python, NumPy, and PyTorch.
-Every training run is logged to MLflow with full hyperparameters, per-epoch metrics,
-and the best checkpoint path.
+**Metrics**
 
-**Contamination guard:** splits.lock records a SHA-256 fingerprint of the test
-contract list. The eval script verifies this fingerprint before running to ensure
-the test set was not modified after the splits were created.
+- **Span F1:** character-overlap F1 between predicted and gold spans of the queried clause, averaged per example. An example with no gold span and no prediction scores 1; otherwise an empty side scores 0.
+- **Per-clause results:** F1 with a 95% bootstrap CI; precision, recall and hit rate on positives; false-positive rate on negatives.
+- **Macro F1:** averaged over clause types present in the split.
+- **Calibration:** reliability table and ECE of span confidence scores.
+- **Adversarial cases (6):** short sentence, no clause, two spans, signature-block boilerplate, wrong-clause query, and a clause beyond the first window.
 
----
+**Results**
 
-## Evaluation Results
-
-Results below are on the held-out test set (15% of contracts, never seen during
-training or hyperparameter selection).
-
-| Metric | FP32 | 4-bit Quantized |
-|---|---|---|
-| Macro F1 | - | - |
-| p99 latency | - | - |
-| Model size | ~180MB | ~45MB |
-| Adversarial pass rate | - | - |
-
-*Fill in after running: python -m src.eval.evaluate --split test*
-
-### Per-clause F1 (test set)
-
-| Clause Type | F1 | 95% CI | n |
-|---|---|---|---|
-| Governing Law | - | - | - |
-| Termination For Convenience | - | - | - |
-| Renewal Term | - | - | - |
-| Non-Compete | - | - | - |
-| Confidentiality Of Agreements | - | - | - |
-| Indemnification | - | - | - |
-| Cap On Liability | - | - | - |
-| Assignment | - | - | - |
-
-*Fill in after running eval.*
-
----
+Pending a re-run of the current pipeline. The last reported run (27 Jul 2026) used the first version of the code. It had data for only 5 of 8 clause types, no negative examples, and a val metric that wasn't comparable to the test metric. Its test span F1 over those 5 types was 0.775, with per-clause F1 from 0.655 (Termination For Convenience) to 0.973 (Governing Law), and p99 latency of 29 ms on a T4. See the README for details. These numbers are not expected to carry over: negatives make the task harder, while multi-span labels and sliding windows should help.
 
 ## Quantization
 
-4-bit NF4 quantization via bitsandbytes. NF4 is information-theoretically
-optimal for normally distributed weights and typically gives less than 1% F1 drop
-with approximately 2-4x latency improvement. The quantization report in
-experiments/quantization_report.json records the exact accuracy/latency tradeoff
-measured on this model.
+- **INT8 dynamic (CPU):** `nn.Linear` weights quantized at load time; compared with FP32 on the same CPU.
+- **NF4 4-bit (GPU, bitsandbytes):** compared with FP32 on the same GPU.
 
-**Serving p99 target:** 150ms per paragraph (single clause type)
+`experiments/quantization_report.json` records the F1 drop, p99 speedup and size for each, after a run.
 
----
+**Serving p99 target:** 150 ms per request for a single 384-token window. Longer documents cost roughly one window per ~256 new tokens.
 
-## Known Limitations
+## Known limitations
 
-**Truncation:** DeBERTa-v3-base accepts up to 512 tokens. Contracts longer than
-this are truncated, and clauses near the end of a long contract may be missed.
-In production, long contracts should be chunked with overlap before extraction.
+- **Coverage:** 8 of CUAD's 41 categories. Adding more means extending `CLAUSE_TYPES` in `src/config.py` and retraining.
+- **Domain:** US commercial contracts, mostly from SEC filings. Expect degradation on non-US law, consumer terms, or heavily formatted or scanned documents (the text comes from PDF extraction).
+- **Span boundaries:** CUAD gold spans are annotator highlights and vary in extent. Character F1 penalises a correct clause found with different boundaries.
+- **Class weighting:** inverse-frequency weighting over-predicts clause tokens, so precision trails recall. Use the per-span `score` (or `min_score` in the API) to trade recall for precision. `src/eval/calibration.py` shows how well scores track precision.
+- **Small evaluation slices:** some clause types have under 40 test examples, so read the bootstrap CIs, not just the point estimates.
 
-**Clause coverage:** Only 8 of 41 CUAD clause types are covered. The remaining
-33 types were excluded for scope but the model architecture supports adding them
-by extending the label set and retraining.
-
-**Domain specificity:** Trained on US commercial contracts. Performance may degrade
-on non-US contracts, consumer agreements, or highly technical contracts (software
-licensing, IP agreements) that differ structurally from the training distribution.
-
-**Near-limit theft claims:** The fraud scorer in a related project consistently
-over-rates near-limit theft claims. This is noted here as a reminder that any
-model has distribution-specific failure modes that must be documented, not hidden.
-
-**Overfit check:** Val F1 and test F1 are reported separately in the eval output.
-If the gap exceeds 5pp, it indicates overfitting to the validation-selected
-hyperparameters and the search should be rerun with more configurations.
-
----
-
-## How to Reproduce
+## How to reproduce
 
 ```bash
-# 1. Prepare data
 python -m src.training.prepare_data
-
-# 2. Train (hyperparameter search, logged to MLflow)
 python -m src.training.train
-
-# 3. Quantize and measure tradeoff
 python -m src.training.quantize
-
-# 4. Evaluate on test set (run once, after training is complete)
 python -m src.eval.evaluate --split test
-
-# 5. Serve
 python -m src.serving.serve
-
-# 6. Load test
 python -m src.serving.load_test --concurrency 4 --n-requests 200
 ```
-
-All runs are tracked in MLflow. Start the UI with:
-```bash
-mlflow ui --backend-store-uri experiments/mlruns
-```
-
----
-
-## Ethical Considerations
-
-This model extracts clause spans from contracts but does not provide legal advice.
-Extracted spans should be reviewed by a qualified legal professional before
-being used for any legal or business decision. False negatives (missed clauses)
-are more dangerous than false positives in this domain.
