@@ -1,11 +1,17 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 .env
 data/*.jsonl
 data/splits.lock
 models/
 experiments/mlruns/
+experiments/mlflow.db
+mlruns/
+mlflow.db
 *.pt
 *.bin
 *.safetensors

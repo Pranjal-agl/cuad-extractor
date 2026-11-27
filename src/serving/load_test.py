@@ -16,13 +16,12 @@ import argparse
 import asyncio
 import json
 import time
-from pathlib import Path
 
 import httpx
 import numpy as np
 
-ROOT = Path(__file__).parent.parent.parent
-EXPERIMENTS_DIR = ROOT / "experiments"
+from src.config import EXPERIMENTS_DIR
+from src.metrics import latency_summary
 
 SAMPLE_CONTRACTS = [
     (
@@ -35,17 +34,24 @@ SAMPLE_CONTRACTS = [
         ["Governing Law", "Termination For Convenience", "Renewal Term"],
     ),
     (
-        "Each party agrees to keep confidential all information received from the other "
-        "party. Company shall indemnify and hold harmless Client from any claims arising "
-        "from Company's breach of this Agreement. In no event shall either party's total "
-        "liability exceed the fees paid in the preceding twelve months.",
-        ["Confidentiality Of Agreements", "Indemnification", "Cap On Liability"],
+        "Licensor shall have the right, upon reasonable notice, to audit Licensee's books "
+        "and records relating to royalties payable hereunder. In no event shall either "
+        "party's total liability exceed the fees paid in the preceding twelve months.",
+        ["Audit Rights", "Cap On Liability"],
     ),
     (
-        "Employee agrees not to compete with Company in any capacity for a period of "
-        "two years following termination. This Agreement may not be assigned by either "
-        "party without the prior written consent of the other party.",
-        ["Non-Compete", "Assignment"],
+        "During the term of this Agreement, Distributor shall be the exclusive distributor "
+        "of the Products in the Territory. Employee agrees not to compete with Company in "
+        "any capacity for a period of two years following termination. This Agreement may "
+        "not be assigned by either party without the prior written consent of the other party.",
+        ["Exclusivity", "Non-Compete", "Anti-Assignment"],
+    ),
+    # Long input: exercises sliding-window inference, all clause types.
+    (
+        "The Supplier shall deliver the Products to the delivery address specified in each "
+        "Purchase Order. Title and risk of loss shall pass upon delivery. " * 30
+        + "This Agreement shall be governed by the laws of the State of New York.",
+        None,
     ),
 ]
 
@@ -53,7 +59,7 @@ SAMPLE_CONTRACTS = [
 async def single_request(
     client: httpx.AsyncClient,
     text: str,
-    clause_types: list[str],
+    clause_types: list[str] | None,
     base_url: str,
 ) -> dict:
     t0 = time.perf_counter()
@@ -65,7 +71,10 @@ async def single_request(
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         if resp.status_code == 200:
-            return {"status": "ok", "latency_ms": latency_ms}
+            body = resp.json()
+            if body.get("error"):
+                return {"status": "degraded", "latency_ms": latency_ms, "error": body["error"]}
+            return {"status": "ok", "latency_ms": latency_ms, "server_ms": body.get("latency_ms")}
         else:
             return {"status": "error", "latency_ms": latency_ms, "code": resp.status_code}
     except Exception as e:
@@ -86,6 +95,15 @@ async def run_load_test(
         async with semaphore:
             return await single_request(client, text, clause_types, base_url)
 
+    async with httpx.AsyncClient() as probe:
+        try:
+            health = (await probe.get(f"{base_url}/health", timeout=10.0)).json()
+        except Exception as e:
+            raise SystemExit(f"Server not reachable at {base_url} ({e}). Start it with "
+                             "`python -m src.serving.serve` first.") from None
+    if not health.get("model_loaded"):
+        raise SystemExit(f"Server at {base_url} has no model loaded: {health}")
+
     t_start = time.perf_counter()
     async with httpx.AsyncClient() as client:
         tasks = [bounded_request(i) for i in range(n_requests)]
@@ -94,7 +112,9 @@ async def run_load_test(
 
     ok = [r for r in results if r["status"] == "ok"]
     latencies = [r["latency_ms"] for r in ok]
+    server = [r["server_ms"] for r in ok if r.get("server_ms") is not None]
     error_rate = (len(results) - len(ok)) / len(results)
+    errors = sorted({r.get("error") or str(r.get("code")) for r in results if r["status"] != "ok"})
 
     return {
         "n_requests": n_requests,
@@ -102,6 +122,8 @@ async def run_load_test(
         "total_time_s": round(total_time, 2),
         "throughput_rps": round(n_requests / total_time, 2),
         "error_rate": round(error_rate, 4),
+        "errors": errors[:10],
+        "server_latency": latency_summary(server),
         "latency": {
             "p50_ms": round(float(np.percentile(latencies, 50)), 2) if latencies else None,
             "p95_ms": round(float(np.percentile(latencies, 95)), 2) if latencies else None,
@@ -122,7 +144,7 @@ def main():
     report = asyncio.run(run_load_test(args.base_url, args.n_requests, args.concurrency))
 
     print(f"\n{'='*50}")
-    print(f"  LOAD TEST RESULTS")
+    print("  LOAD TEST RESULTS")
     print(f"{'='*50}")
     print(f"  Throughput   : {report['throughput_rps']} req/s")
     print(f"  Error rate   : {report['error_rate']:.1%}")
@@ -131,10 +153,14 @@ def main():
     print(f"  p99 latency  : {report['latency']['p99_ms']}ms")
     print(f"{'='*50}")
 
+    EXPERIMENTS_DIR.mkdir(exist_ok=True)
     out = EXPERIMENTS_DIR / "load_test_report.json"
     with open(out, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"\nReport written → {out}")
+    print(f"\nReport written -> {out}")
+    if report["error_rate"] > 0:
+        print(f"WARNING: {report['error_rate']:.1%} of requests failed: {report['errors']}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -2,29 +2,35 @@
 src/training/train.py
 
 Fine-tunes DeBERTa-v3-base on CUAD clause extraction as a token-classification
-task (BIO tagging). Each token is labelled B-CLAUSE, I-CLAUSE, or O.
+task (BIO tagging): each token is labelled B-<clause>, I-<clause>, or O.
 
 HYPERPARAMETER SEARCH
 ---------------------
-Grid search over 6 configurations on the validation set.
-Best configuration selected by macro-averaged F1 on val.
-Test set is only evaluated once, on the best configuration.
+Grid search over HPARAM_GRID on the validation set. The selection metric is
+the SAME span-level macro F1 that evaluate.py reports on the test set, so the
+val-vs-test comparison is apples to apples. (The first version selected on a
+token-level F1 averaged over 8 clause types, 3 of which had no data, and then
+compared that number to a span-level test F1 averaged over 5.)
+Test data is never touched here.
 
-All runs logged to MLflow under experiment "cuad-extraction".
+All runs are logged to MLflow (store configured in src.config).
 
-REPRODUCIBILITY
----------------
-Seed is set for Python, NumPy, and PyTorch at the start of every run.
+USAGE
+-----
+    python -m src.training.train                 # full grid
+    python -m src.training.train --configs 3,7   # subset (1-based indices)
+    python -m src.training.train --prune         # delete non-best checkpoints
 """
 
-import os
-os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+from __future__ import annotations
 
+import argparse
+import gc
 import json
-import random
-from pathlib import Path
+import shutil
+import subprocess
+from collections import Counter
 
-import mlflow
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -35,93 +41,79 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-ROOT = Path(__file__).parent.parent.parent
-DATA_DIR = ROOT / "data"
-MODELS_DIR = ROOT / "models"
-MODELS_DIR.mkdir(exist_ok=True)
+from src.config import (
+    CLAUSE_TYPES,
+    DATA_DIR,
+    ID2LABEL,
+    LABEL2ID,
+    MAX_LENGTH,
+    MODEL_NAME,
+    MODELS_DIR,
+    NUM_LABELS,
+    ROOT,
+    SEED,
+    STRIDE,
+    setup_mlflow,
+)
+from src.metrics import set_seed
+from src.spans import IGNORE_INDEX, label_tokens, token_level_f1
+from src.training.prepare_data import example_spans
 
-MODEL_NAME = "microsoft/deberta-v3-base"
-EXPERIMENT_NAME = "cuad-extraction"
-SEED = 42
-
-CLAUSE_TYPES = [
-    "Governing Law",
-    "Termination For Convenience",
-    "Renewal Term",
-    "Non-Compete",
-    "Cap On Liability",
-    "Anti-Assignment",
-    "Audit Rights",
-    "Exclusivity",
-]
-
-LABEL2ID = {"O": 0}
-for i, clause in enumerate(CLAUSE_TYPES):
-    LABEL2ID[f"B-{clause}"] = 2 * i + 1
-    LABEL2ID[f"I-{clause}"] = 2 * i + 2
-ID2LABEL = {v: k for k, v in LABEL2ID.items()}
-
+# class_weighting:
+#   inverse       weight_c = N / (K * count_c). What the first run used. It
+#                 fixed the all-"O" collapse but over-corrected: the model
+#                 predicted 2.3x more clause tokens than exist (34,335 vs
+#                 14,946 on val) and precision trails recall on every clause.
+#   sqrt_inverse  square root of the above -- the usual softer variant.
 HPARAM_GRID = [
-    {"lr": 1e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1},
-    {"lr": 1e-5, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1},
-    {"lr": 2e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1},
-    {"lr": 2e-5, "batch_size": 16, "epochs": 3, "warmup_ratio": 0.1},
-    {"lr": 5e-6, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1},
-    {"lr": 3e-5, "batch_size": 8,  "epochs": 2, "warmup_ratio": 0.15},
+    {"lr": 1e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1,  "class_weighting": "inverse"},
+    {"lr": 1e-5, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1,  "class_weighting": "inverse"},
+    {"lr": 2e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1,  "class_weighting": "inverse"},
+    {"lr": 2e-5, "batch_size": 16, "epochs": 3, "warmup_ratio": 0.1,  "class_weighting": "inverse"},
+    {"lr": 5e-6, "batch_size": 8,  "epochs": 5, "warmup_ratio": 0.1,  "class_weighting": "inverse"},
+    {"lr": 3e-5, "batch_size": 8,  "epochs": 2, "warmup_ratio": 0.15, "class_weighting": "inverse"},
+    {"lr": 2e-5, "batch_size": 8,  "epochs": 3, "warmup_ratio": 0.1,  "class_weighting": "sqrt_inverse"},
 ]
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def load_jsonl(path: Path) -> list[dict]:
+def load_jsonl(path) -> list[dict]:
     with open(path) as f:
-        return [json.loads(l) for l in f if l.strip()]
+        return [json.loads(line) for line in f if line.strip()]
 
 
-def tokenize_and_label(example: dict, tokenizer, max_length: int = 512) -> dict:
-    encoding = tokenizer(
-        example["context"], max_length=max_length,
-        truncation=True, padding=False, return_offsets_mapping=True,
+def tokenize_and_label(example: dict, tokenizer, max_length: int = MAX_LENGTH,
+                       stride: int = STRIDE) -> list[dict]:
+    """Tokenize one example into one or more overlapping windows with BIO labels.
+
+    Contexts longer than `max_length` tokens used to be truncated, and a span
+    running past the cut lost its labels entirely (the example silently
+    became all-"O"). Windows keep every annotated token.
+    """
+    enc = tokenizer(
+        example["context"], max_length=max_length, truncation=True, stride=stride,
+        return_overflowing_tokens=True, return_offsets_mapping=True, padding=False,
     )
-    offsets = encoding["offset_mapping"]
-    labels = [LABEL2ID["O"]] * len(offsets)
-    clause = example["clause"]
-
-    for answer_text in example["answers"]:
-        start_char = example["context"].find(answer_text)
-        if start_char == -1:
-            continue
-        end_char = start_char + len(answer_text)
-        token_start = None
-        token_end = None
-        for idx, (tok_start, tok_end) in enumerate(offsets):
-            if tok_start <= start_char < tok_end and token_start is None:
-                token_start = idx
-            if tok_start < end_char <= tok_end:
-                token_end = idx
-        if token_start is not None and token_end is not None:
-            labels[token_start] = LABEL2ID[f"B-{clause}"]
-            for i in range(token_start + 1, token_end + 1):
-                labels[i] = LABEL2ID[f"I-{clause}"]
-
-    for idx, (tok_start, tok_end) in enumerate(offsets):
-        if tok_start == tok_end == 0:
-            labels[idx] = -100
-
-    encoding.pop("offset_mapping")
-    encoding["labels"] = labels
-    return encoding
+    spans = example_spans(example)
+    windows = []
+    for i in range(len(enc["input_ids"])):
+        windows.append({
+            "input_ids": enc["input_ids"][i],
+            "attention_mask": enc["attention_mask"][i],
+            "labels": label_tokens(enc["offset_mapping"][i], spans, LABEL2ID),
+        })
+    return windows
 
 
 class CUADDataset(Dataset):
-    def __init__(self, examples: list[dict], tokenizer, max_length: int = 512):
-        self.encodings = [tokenize_and_label(ex, tokenizer, max_length) for ex in examples]
+    def __init__(self, examples: list[dict], tokenizer, max_length: int = MAX_LENGTH):
+        self.encodings = [w for ex in examples for w in tokenize_and_label(ex, tokenizer, max_length)]
+        # Validate once here instead of on every batch inside the training loop.
+        vocab = len(tokenizer)
+        for enc in self.encodings:
+            if max(enc["input_ids"]) >= vocab or min(enc["input_ids"]) < 0:
+                raise ValueError(f"input_ids out of range for tokenizer vocab size {vocab}")
+            if any(lab != IGNORE_INDEX and not 0 <= lab < NUM_LABELS for lab in enc["labels"]):
+                raise ValueError("label id out of range")
 
     def __len__(self):
         return len(self.encodings)
@@ -130,258 +122,209 @@ class CUADDataset(Dataset):
         return {k: torch.tensor(v) for k, v in self.encodings[idx].items()}
 
 
-def compute_f1(preds: list[int], labels: list[int]) -> dict[str, float]:
-    from collections import defaultdict
-    tp = defaultdict(int)
-    fp = defaultdict(int)
-    fn = defaultdict(int)
-
-    for pred, label in zip(preds, labels):
-        if label == -100:
-            continue
-        pred_clause = ID2LABEL.get(pred, "O")
-        true_clause = ID2LABEL.get(label, "O")
-        pred_c = pred_clause.split("-", 1)[-1] if pred_clause != "O" else "O"
-        true_c = true_clause.split("-", 1)[-1] if true_clause != "O" else "O"
-        if true_c != "O":
-            if pred_c == true_c:
-                tp[true_c] += 1
-            else:
-                fn[true_c] += 1
-                if pred_c != "O":
-                    fp[pred_c] += 1
-        elif pred_c != "O":
-            fp[pred_c] += 1
-
-    results = {}
-    for clause in CLAUSE_TYPES:
-        t, f, p_err = tp[clause], fn[clause], fp[clause]
-        precision = t / (t + p_err) if (t + p_err) > 0 else 0.0
-        recall = t / (t + f) if (t + f) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-        results[clause] = round(f1, 4)
-
-    results["macro"] = round(float(np.mean(list(results.values()))), 4)
-    return results
+def class_weights(dataset: CUADDataset, scheme: str) -> torch.Tensor | None:
+    if scheme == "none":
+        return None
+    counts = torch.zeros(NUM_LABELS)
+    for enc in dataset.encodings:
+        for lab in enc["labels"]:
+            if lab != IGNORE_INDEX:
+                counts[lab] += 1
+    seen = counts > 0
+    weights = torch.ones(NUM_LABELS)
+    # Labels that never occur get weight 1 (they used to get ~20,000x).
+    weights[seen] = counts[seen].sum() / (int(seen.sum()) * counts[seen])
+    if scheme == "sqrt_inverse":
+        weights = weights.sqrt()
+    elif scheme != "inverse":
+        raise ValueError(f"unknown class_weighting {scheme!r}")
+    return weights
 
 
-def train_one_config(config, train_examples, val_examples, tokenizer, run_name):
+def _git_commit() -> str | None:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+                                       stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return None
+
+
+def validate(model, tokenizer, val_examples, val_loader, device) -> dict:
+    """Span-level metrics (selection metric) + token-level F1 (diagnostic)."""
+    from src.eval.evaluate import run_eval
+    from src.inference import ClauseExtractor
+
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
+            all_preds.extend(logits.argmax(-1).flatten().tolist())
+            all_labels.extend(batch["labels"].flatten().tolist())
+    tok = token_level_f1(all_preds, all_labels, ID2LABEL, CLAUSE_TYPES)
+
+    pred_dist = Counter(p for p, lab in zip(all_preds, all_labels) if lab != IGNORE_INDEX and p != 0)
+    n_true = sum(1 for lab in all_labels if lab not in (IGNORE_INDEX, 0))
+    span = run_eval(ClauseExtractor(model, tokenizer), val_examples, split_name="val", verbose=False)
+    return {"span": span, "token": tok,
+            "pred_non_o": sum(pred_dist.values()), "true_non_o": n_true}
+
+
+def train_one_config(config, train_ds, val_examples, val_ds, tokenizer, run_name, mlflow):
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Using device: {device}"
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
     model = AutoModelForTokenClassification.from_pretrained(
-        MODEL_NAME, num_labels=len(LABEL2ID),
-        id2label=ID2LABEL, label2id=LABEL2ID, ignore_mismatched_sizes=True,
+        MODEL_NAME, num_labels=NUM_LABELS, id2label=ID2LABEL, label2id=LABEL2ID,
+        ignore_mismatched_sizes=True,
     ).to(device)
 
-
-
-    # max_length=384 keeps sequences clear of the 512 boundary where
-    # DeBERTa-v2/v3's relative-position bucket lookup in
-    # disentangled_attention_bias can index out of range and silently
-    # read garbage (NaN) on CUDA instead of raising. This is the actual
-    # source of the NaN pattern -- it happens identically at every LR
-    # we tried, which rules out an optimizer/precision cause.
-    train_ds = CUADDataset(train_examples, tokenizer, max_length=384)
-    val_ds = CUADDataset(val_examples, tokenizer, max_length=384)
     collator = DataCollatorForTokenClassification(tokenizer)
+    weights = class_weights(train_ds, config.get("class_weighting", "inverse"))
+    if weights is not None:
+        print(f"  Class weights ({config.get('class_weighting')}): min={weights.min():.3f} "
+              f"max={weights.max():.3f} O={weights[LABEL2ID['O']]:.3f}")
+        weights = weights.to(device)
+    loss_fct = torch.nn.CrossEntropyLoss(weight=weights, ignore_index=IGNORE_INDEX)
 
-    # The model was collapsing to all-"O" predictions: confirmed via
-    # [LABEL-DIST] diagnostics showing 0/14946 non-O tokens predicted across
-    # 3 full epochs while loss still dropped. This is because O vastly
-    # outnumbers B-/I- tokens (a short clause span inside a long context),
-    # and unweighted cross-entropy is minimized by ignoring the minority
-    # classes entirely. Compute inverse-frequency class weights from the
-    # actual training label distribution and use them explicitly.
-    label_counts = torch.zeros(len(LABEL2ID))
-    for enc in train_ds.encodings:
-        for lab in enc["labels"]:
-            if lab != -100:
-                label_counts[lab] += 1
-    label_counts = torch.clamp(label_counts, min=1)  # avoid div-by-zero for any unseen label
-    class_weights = (label_counts.sum() / (len(LABEL2ID) * label_counts)).to(device)
-    print(f"  Class weights (min={class_weights.min().item():.3f}, "
-          f"max={class_weights.max().item():.3f}, O weight={class_weights[LABEL2ID['O']].item():.3f})")
-    loss_fct = torch.nn.CrossEntropyLoss(weight=class_weights, ignore_index=-100)
-
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, collate_fn=collator)
+    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, collate_fn=collator,
+                              generator=torch.Generator().manual_seed(SEED))
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"] * 2, shuffle=False, collate_fn=collator)
 
-    # DeBERTa-v3's gradient-disentangled embedding sharing produces very small
-    # gradients for some parameters early in training. With AdamW's default
-    # eps=1e-8, the adaptive step size (lr / (sqrt(v) + eps)) can spike for
-    # those parameters, which is consistent with "one fine step, then every
-    # subsequent forward pass NaN" regardless of learning rate. Using eps=1e-6
-    # is the documented stability fix for fine-tuning this model family.
+    # eps=1e-6: DeBERTa-v3's gradient-disentangled embedding sharing produces
+    # tiny early gradients; with AdamW's default eps=1e-8 the adaptive step
+    # can spike and the loss goes NaN after one step.
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=0.01, eps=1e-6)
     total_steps = len(train_loader) * config["epochs"]
-    warmup_steps = int(total_steps * config["warmup_ratio"])
-    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(total_steps * config["warmup_ratio"]), total_steps)
+
+    model_path = MODELS_DIR / run_name
+    best_val_f1 = -1.0
+    best_epoch = None
 
     with mlflow.start_run(run_name=run_name):
-        mlflow.log_params({**config, "seed": SEED, "model": MODEL_NAME})
-        best_val_f1 = 0.0
-        model_path = MODELS_DIR / run_name
+        mlflow.log_params({**config, "seed": SEED, "model": MODEL_NAME, "max_length": MAX_LENGTH,
+                           "stride": STRIDE, "n_train_windows": len(train_ds),
+                           "git_commit": _git_commit() or "unknown"})
 
         for epoch in range(config["epochs"]):
             model.train()
-            total_loss = 0.0
-            n_valid_steps = 0
-            n_skipped_loss = 0
-            n_skipped_grad = 0
+            total_loss, n_valid, n_bad_loss, n_bad_grad = 0.0, 0, 0, 0
             for batch in train_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-
-                # Sanity-check indices BEFORE the forward pass. An out-of-range
-                # input_id (embedding lookup) or label (loss target) causes an
-                # async CUDA illegal-memory-access that does not raise cleanly --
-                # it silently corrupts the CUDA context, and every op after that
-                # returns NaN/garbage for the rest of the process, regardless of
-                # LR, batch size, or model version. That matches this run's
-                # symptoms exactly, so we check explicitly rather than guess again.
-                vocab_size = model.config.vocab_size
-                bad_ids = batch["input_ids"][(batch["input_ids"] < 0) | (batch["input_ids"] >= vocab_size)]
-                if bad_ids.numel() > 0:
-                    raise ValueError(
-                        f"input_ids out of range for vocab_size={vocab_size}: "
-                        f"found values {bad_ids.unique().tolist()[:10]}"
-                    )
-                label_vals = batch["labels"]
-                valid_label_mask = (label_vals == -100) | ((label_vals >= 0) & (label_vals < len(LABEL2ID)))
-                if not torch.all(valid_label_mask):
-                    bad_labels = label_vals[~valid_label_mask]
-                    raise ValueError(
-                        f"labels out of range for num_labels={len(LABEL2ID)}: "
-                        f"found values {bad_labels.unique().tolist()[:10]}"
-                    )
-
-                out = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch.get("attention_mask"),
-                )
-                loss = loss_fct(out.logits.view(-1, len(LABEL2ID)), batch["labels"].view(-1))
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    n_skipped_loss += 1
+                out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                loss = loss_fct(out.logits.view(-1, NUM_LABELS), batch["labels"].view(-1))
+                if not torch.isfinite(loss):
+                    n_bad_loss += 1
                     optimizer.zero_grad()
                     continue
-
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-                # Critical: DeBERTa-v3's disentangled attention can produce a
-                # finite loss but NaN/Inf gradients during backward(). If we
-                # call optimizer.step() here, NaN propagates into the model
-                # weights permanently -- every subsequent batch becomes NaN
-                # from then on, even with a completely different sequence.
-                # Skip the step entirely rather than let this happen.
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    n_skipped_grad += 1
+                # A finite loss can still produce NaN/Inf gradients; stepping on
+                # them would poison the weights for the rest of the run.
+                if not torch.isfinite(grad_norm):
+                    n_bad_grad += 1
                     optimizer.zero_grad()
                     continue
-
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 total_loss += loss.item()
-                n_valid_steps += 1
+                n_valid += 1
 
-            total_skipped = n_skipped_loss + n_skipped_grad
-            if total_skipped > 0:
-                print(f"  [WARNING] Skipped {total_skipped}/{len(train_loader)} batches "
-                      f"({n_skipped_loss} NaN loss, {n_skipped_grad} NaN gradient)")
-
-            avg_loss = total_loss / n_valid_steps if n_valid_steps > 0 else float("nan")
-            mlflow.log_metric("train_loss", avg_loss, step=epoch)
-            mlflow.log_metric("n_skipped_loss", n_skipped_loss, step=epoch)
-            mlflow.log_metric("n_skipped_grad", n_skipped_grad, step=epoch)
-
-            if n_valid_steps == 0:
-                print(f"  [ERROR] Zero valid steps in epoch {epoch+1} -- "
-                      f"this config is fundamentally unstable, moving to next config.")
+            if n_bad_loss or n_bad_grad:
+                print(f"  [WARNING] skipped {n_bad_loss + n_bad_grad}/{len(train_loader)} batches "
+                      f"({n_bad_loss} non-finite loss, {n_bad_grad} non-finite grad)")
+            avg_loss = total_loss / n_valid if n_valid else float("nan")
+            mlflow.log_metrics({"train_loss": avg_loss, "n_skipped_loss": n_bad_loss,
+                                "n_skipped_grad": n_bad_grad}, step=epoch)
+            if n_valid == 0:
+                print(f"  [ERROR] zero valid steps in epoch {epoch + 1}; abandoning this config.")
                 break
 
-            model.eval()
-            all_preds, all_labels = [], []
-            with torch.no_grad():
-                for batch in val_loader:
-                    batch = {k: v.to(device) for k, v in batch.items()}
-                    out = model(**batch)
-                    preds = out.logits.argmax(dim=-1).cpu().numpy().flatten().tolist()
-                    labels = batch["labels"].cpu().numpy().flatten().tolist()
-                    all_preds.extend(preds)
-                    all_labels.extend(labels)
+            v = validate(model, tokenizer, val_examples, val_loader, device)
+            span_f1 = v["span"]["macro_f1"]
+            mlflow.log_metrics({"val_span_macro_f1": span_f1, "val_token_macro_f1": v["token"]["macro"],
+                                "val_pred_non_o_tokens": v["pred_non_o"]}, step=epoch)
+            for clause, m in v["span"]["per_clause"].items():
+                if m["f1"] is not None:
+                    mlflow.log_metric(f"val_f1_{clause.replace(' ', '_').replace('-', '_')}", m["f1"], step=epoch)
+            print(f"  epoch {epoch + 1}/{config['epochs']}  loss={avg_loss:.4f}  "
+                  f"val_span_macro_f1={span_f1:.4f}  val_token_macro_f1={v['token']['macro']:.4f}  "
+                  f"non-O tokens pred/true={v['pred_non_o']}/{v['true_non_o']}")
 
-            f1s = compute_f1(all_preds, all_labels)
-            mlflow.log_metric("val_macro_f1", f1s["macro"], step=epoch)
-            for clause, f1 in f1s.items():
-                mlflow.log_metric(f"val_f1_{clause.replace(' ', '_')}", f1, step=epoch)
-
-            # Diagnostic: confirm whether the model is collapsing to all-"O"
-            # predictions (severe class imbalance) rather than there being a
-            # bug in the F1 computation itself.
-            from collections import Counter
-            pred_dist = Counter(ID2LABEL.get(p, "O") for p, l in zip(all_preds, all_labels) if l != -100)
-            true_dist = Counter(ID2LABEL.get(l, "O") for l in all_labels if l != -100)
-            n_pred_nonO = sum(v for k, v in pred_dist.items() if k != "O")
-            n_true_nonO = sum(v for k, v in true_dist.items() if k != "O")
-            print(f"  [LABEL-DIST] predicted non-O tokens: {n_pred_nonO} / true non-O tokens: {n_true_nonO}")
-
-            print(f"  epoch {epoch+1}/{config['epochs']}  loss={avg_loss:.4f}  val_macro_f1={f1s['macro']:.4f}")
-
-            if f1s["macro"] > best_val_f1:
-                best_val_f1 = f1s["macro"]
+            if span_f1 > best_val_f1:
+                best_val_f1, best_epoch = span_f1, epoch + 1
                 model.save_pretrained(model_path)
                 tokenizer.save_pretrained(model_path)
 
-        # Safety net: if val F1 never improved past 0 (e.g. every epoch
-        # collapsed), still save the final epoch's weights so downstream
-        # steps (quantize.py, evaluate.py) have a real checkpoint to load
-        # instead of crashing on a missing directory.
-        if not model_path.exists():
+        if not model_path.exists():  # always leave a loadable checkpoint behind
             model.save_pretrained(model_path)
             tokenizer.save_pretrained(model_path)
+        mlflow.log_metric("best_val_span_macro_f1", max(best_val_f1, 0.0))
+        mlflow.log_params({"model_path": str(model_path), "best_epoch": best_epoch})
 
-        mlflow.log_metric("best_val_macro_f1", best_val_f1)
-        mlflow.log_param("model_path", str(model_path))
-
-    return best_val_f1, model_path
+    del model, optimizer, scheduler
+    return max(best_val_f1, 0.0), model_path, best_epoch
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--configs", default=None,
+                        help="comma-separated 1-based indices into HPARAM_GRID (default: all)")
+    parser.add_argument("--prune", action="store_true", help="delete non-best run checkpoints at the end")
+    args = parser.parse_args()
+
     from src.training.prepare_data import verify_lock
     verify_lock()
 
+    indices = [int(i) for i in args.configs.split(",")] if args.configs else range(1, len(HPARAM_GRID) + 1)
+    MODELS_DIR.mkdir(exist_ok=True)
     train_examples = load_jsonl(DATA_DIR / "train.jsonl")
     val_examples = load_jsonl(DATA_DIR / "val.jsonl")
     print(f"Train: {len(train_examples)} | Val: {len(val_examples)}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    mlflow.set_experiment(EXPERIMENT_NAME)
+    train_ds = CUADDataset(train_examples, tokenizer)
+    val_ds = CUADDataset(val_examples, tokenizer)
+    print(f"Windows: {len(train_ds)} train / {len(val_ds)} val (max_length={MAX_LENGTH}, stride={STRIDE})")
+    mlflow = setup_mlflow()
 
     results = []
-    for i, config in enumerate(HPARAM_GRID):
-        run_name = f"run_{i+1}_lr{config['lr']}_bs{config['batch_size']}_ep{config['epochs']}"
-        print(f"\n[{i+1}/{len(HPARAM_GRID)}] {run_name}")
-        val_f1, model_path = train_one_config(config, train_examples, val_examples, tokenizer, run_name)
-        results.append({"config": config, "val_f1": val_f1, "model_path": str(model_path), "run_name": run_name})
-        print(f"  Best val macro F1: {val_f1:.4f}")
-
-        import gc
+    for i in indices:
+        config = HPARAM_GRID[i - 1]
+        run_name = (f"run_{i}_lr{config['lr']}_bs{config['batch_size']}_ep{config['epochs']}"
+                    f"_{config['class_weighting']}")
+        print(f"\n[{i}/{len(HPARAM_GRID)}] {run_name}")
+        val_f1, model_path, best_epoch = train_one_config(
+            config, train_ds, val_examples, val_ds, tokenizer, run_name, mlflow)
+        results.append({"config": config, "val_f1": val_f1, "best_epoch": best_epoch,
+                        "model_path": str(model_path.relative_to(ROOT)), "run_name": run_name})
+        print(f"  Best val span macro F1: {val_f1:.4f} (epoch {best_epoch})")
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    best = max(results, key=lambda x: x["val_f1"])
-    print(f"\nBest config: {best['run_name']}  val_macro_f1={best['val_f1']:.4f}")
-    print(f"Model saved to: {best['model_path']}")
+    best = max(results, key=lambda r: r["val_f1"])
+    print(f"\nBest config: {best['run_name']}  val_span_macro_f1={best['val_f1']:.4f}")
+    selection = {**best, "selection_metric": "val_span_macro_f1", "all_runs": results}
+    (MODELS_DIR / "best_config.json").write_text(json.dumps(selection, indent=2))
+    print(f"Selection saved -> {MODELS_DIR / 'best_config.json'}")
 
-    selection_path = MODELS_DIR / "best_config.json"
-    with open(selection_path, "w") as f:
-        json.dump(best, f, indent=2)
-    print(f"Selection saved -> {selection_path}")
+    if args.prune:
+        for r in results:
+            if r["run_name"] != best["run_name"]:
+                shutil.rmtree(ROOT / r["model_path"], ignore_errors=True)
+        print("Pruned non-best checkpoints.")
+
+    summary = sorted(results, key=lambda r: -r["val_f1"])
+    print("\nRun summary (val span macro F1):")
+    for r in summary:
+        print(f"  {r['val_f1']:.4f}  {r['run_name']}")
+    print(f"Mean across runs: {np.mean([r['val_f1'] for r in results]):.4f}")
 
 
 if __name__ == "__main__":

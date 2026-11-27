@@ -6,93 +6,68 @@ FastAPI serving endpoint for the CUAD clause extractor.
 ENDPOINTS
 ---------
 POST /extract
-  Input:  {"text": str, "clause_types": list[str] | null}
-  Output: {"clauses": {clause_type: [span, ...]}, "latency_ms": float}
+  Input:  {"text": str, "clause_types": list[str] | null, "min_score": float}
+  Output: {"clauses":  {clause_type: [span_text, ...]},
+           "spans":    {clause_type: [{"text", "start", "end", "score"}, ...]},
+           "latency_ms", "n_windows", "p99_exceeded", "error"}
+GET /health   model status + rolling p99 over the last 1000 requests
+GET /metrics  latency percentiles and share of requests over target
+GET /clauses  clause types the loaded model supports
 
-GET /health
-  Returns model status and p99 latency from the last 1000 requests.
-
-GET /metrics
-  Returns full latency histogram and per-clause request counts.
+CONFIGURATION (environment variables)
+-------------------------------------
+CUAD_MODEL_PATH       checkpoint dir (default: models/best_config.json)
+CUAD_QUANTIZE         none | int8 (CPU) | nf4 (GPU)       default: none
+CUAD_LOG_PREDICTIONS  1 to append predictions to data/production_log.jsonl
+                      for src.eval.monitor                   default: 0
+CUAD_MAX_CHARS        reject longer inputs with 413          default: 200000
 
 DESIGN
 ------
-- Single model instance, loaded once at startup
-- Per-request latency tracked in a rolling window (last 1000)
-- Requests exceeding the p99 target are flagged in the response
-- Graceful degradation: if model fails, returns empty spans with error flag
-  rather than 500
-
-LOAD TEST
----------
-Run load_test.py to simulate concurrent requests and get real p99 numbers.
+- One model instance loaded at startup. Startup fails loudly if no model is
+  found, rather than serving a broken API.
+- All clause types come from a single forward pass per window; long texts are
+  covered by overlapping sliding windows (see src.inference).
+- /extract is a plain `def`, so FastAPI runs it in its threadpool and the
+  event loop stays free for /health. A lock serialises model calls so
+  concurrent requests don't oversubscribe CPU threads / GPU memory.
+- Graceful degradation: if inference fails, the request returns empty spans
+  with an error message instead of a 500.
 """
 
+from __future__ import annotations
+
+import logging
+import os
+import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
-import torch
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 
-ROOT = Path(__file__).parent.parent.parent
+from src.config import P99_LATENCY_TARGET_MS
 
-CLAUSE_TYPES = [
-    "Governing Law", "Termination For Convenience", "Renewal Term",
-    "Non-Compete", "Confidentiality Of Agreements", "Indemnification",
-    "Cap On Liability", "Assignment",
-]
-P99_TARGET_MS = 150
 LATENCY_WINDOW = 1000
+MAX_CHARS = int(os.environ.get("CUAD_MAX_CHARS", "200000"))
 
-# Global model state
-_model = None
-_tokenizer = None
+log = logging.getLogger("cuad.serve")
 _latency_window: deque = deque(maxlen=LATENCY_WINDOW)
-
-
-def _load_model():
-    global _model, _tokenizer
-    import json
-    from transformers import AutoModelForTokenClassification, AutoTokenizer
-    from pathlib import Path
-
-    models_dir = ROOT / "models"
-    quant_path = models_dir / "quantized_4bit"
-    best_path_file = models_dir / "best_config.json"
-
-    if quant_path.exists() and torch.cuda.is_available():
-        from transformers import BitsAndBytesConfig
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.float16,
-        )
-        _model = AutoModelForTokenClassification.from_pretrained(
-            quant_path, quantization_config=bnb, device_map="auto"
-        )
-        _tokenizer = AutoTokenizer.from_pretrained(quant_path)
-        print("Loaded 4-bit quantized model")
-    elif best_path_file.exists():
-        with open(best_path_file) as f:
-            model_path = Path(json.load(f)["model_path"])
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _model = AutoModelForTokenClassification.from_pretrained(model_path).to(device)
-        _tokenizer = AutoTokenizer.from_pretrained(model_path)
-        print(f"Loaded FP32 model on {device}")
-    else:
-        raise RuntimeError("No trained model found. Run train.py first.")
-
-    _model.eval()
+_model_lock = threading.Lock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_model()
+    from src.inference import ClauseExtractor
+
+    quantize = os.environ.get("CUAD_QUANTIZE", "none")
+    app.state.extractor = ClauseExtractor.load(os.environ.get("CUAD_MODEL_PATH"), quantize=quantize)
+    app.state.quantize = quantize
+    app.state.log_predictions = os.environ.get("CUAD_LOG_PREDICTIONS", "0") == "1"
+    app.state.extractor.extract("Warm-up request.")  # keep one-off init cost out of the first real request
+    log.info("Loaded model (quantize=%s) on %s", quantize, app.state.extractor.device)
     yield
 
 
@@ -105,91 +80,119 @@ app = FastAPI(
 
 class ExtractRequest(BaseModel):
     text: str
-    clause_types: Optional[list[str]] = None  # None = extract all 8 types
+    clause_types: list[str] | None = None  # None = every clause type the model knows
+    min_score: float = Field(0.0, ge=0.0, le=1.0, description="drop spans below this confidence")
+
+
+class Span(BaseModel):
+    text: str
+    start: int
+    end: int
+    score: float | None = None
 
 
 class ExtractResponse(BaseModel):
     clauses: dict[str, list[str]]
+    spans: dict[str, list[Span]]
     latency_ms: float
+    n_windows: int = 0
     p99_exceeded: bool
-    error: Optional[str] = None
-
-
-def _extract_spans(text: str, clause: str) -> list[str]:
-    from src.eval.evaluate import predict
-    spans, _ = predict(_model, _tokenizer, text, clause)
-    return spans
+    error: str | None = None
 
 
 @app.post("/extract", response_model=ExtractResponse)
-async def extract(req: ExtractRequest):
+def extract(req: ExtractRequest, request: Request):
+    extractor = request.app.state.extractor
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text must not be empty")
-
-    target_clauses = req.clause_types or CLAUSE_TYPES
-    invalid = [c for c in target_clauses if c not in CLAUSE_TYPES]
+    if len(req.text) > MAX_CHARS:
+        raise HTTPException(status_code=413, detail=f"text longer than {MAX_CHARS} characters")
+    targets = req.clause_types or extractor.clause_types
+    invalid = [c for c in targets if c not in extractor.clause_types]
     if invalid:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown clause types: {invalid}. Valid: {CLAUSE_TYPES}"
-        )
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown clause types: {invalid}. Valid: {extractor.clause_types}")
 
     t0 = time.perf_counter()
-    result_clauses: dict[str, list[str]] = {}
-    error_msg = None
-
+    spans: dict[str, list[dict]] = {c: [] for c in targets}
+    error_msg, n_windows = None, 0
     try:
-        for clause in target_clauses:
-            result_clauses[clause] = _extract_spans(req.text, clause)
-    except Exception as e:
-        error_msg = str(e)
-        result_clauses = {c: [] for c in target_clauses}
+        with _model_lock:
+            out = extractor.extract(req.text, clause_types=targets)
+        n_windows = out["n_windows"]
+        for sp in out["spans"]:
+            if sp.get("score") is None or sp["score"] >= req.min_score:
+                spans[sp["clause"]].append(
+                    {"text": sp["text"], "start": sp["start"], "end": sp["end"], "score": sp.get("score")})
+    except Exception as e:  # graceful degradation
+        log.exception("inference failed")
+        error_msg = f"inference failed: {type(e).__name__}"
+        spans = {c: [] for c in targets}
 
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     _latency_window.append(latency_ms)
 
+    if request.app.state.log_predictions and error_msg is None:
+        from src.eval.monitor import log_prediction
+
+        for clause, items in spans.items():
+            scores = [s["score"] for s in items if s["score"] is not None]
+            log_prediction(req.text, clause, [s["text"] for s in items], latency_ms,
+                           confidence=max(scores) if scores else None)
+
     return ExtractResponse(
-        clauses=result_clauses,
+        clauses={c: [s["text"] for s in items] for c, items in spans.items()},
+        spans=spans,
         latency_ms=latency_ms,
-        p99_exceeded=latency_ms > P99_TARGET_MS,
+        n_windows=n_windows,
+        p99_exceeded=latency_ms > P99_LATENCY_TARGET_MS,
         error=error_msg,
     )
 
 
+@app.get("/clauses")
+def clauses(request: Request):
+    return {"clause_types": request.app.state.extractor.clause_types}
+
+
 @app.get("/health")
-async def health():
+def health(request: Request):
     lats = list(_latency_window)
+    p99 = float(np.percentile(lats, 99)) if lats else None
+    extractor = getattr(request.app.state, "extractor", None)
     return {
-        "status": "ok" if _model is not None else "no_model",
-        "model_loaded": _model is not None,
+        "status": "ok" if extractor is not None else "no_model",
+        "model_loaded": extractor is not None,
+        "quantize": getattr(request.app.state, "quantize", None),
+        "device": str(extractor.device) if extractor is not None else None,
         "requests_tracked": len(lats),
-        "p99_ms": round(float(np.percentile(lats, 99)), 2) if lats else None,
-        "p99_target_ms": P99_TARGET_MS,
-        "p99_target_met": (
-            float(np.percentile(lats, 99)) <= P99_TARGET_MS
-        ) if lats else None,
+        "p99_ms": round(p99, 2) if p99 is not None else None,
+        "p99_target_ms": P99_LATENCY_TARGET_MS,
+        "p99_target_met": (p99 <= P99_LATENCY_TARGET_MS) if p99 is not None else None,
     }
 
 
 @app.get("/metrics")
-async def metrics():
+def metrics():
     lats = list(_latency_window)
     if not lats:
         return {"message": "No requests yet"}
+    p99 = float(np.percentile(lats, 99))
     return {
         "n_requests": len(lats),
         "p50_ms": round(float(np.percentile(lats, 50)), 2),
         "p95_ms": round(float(np.percentile(lats, 95)), 2),
-        "p99_ms": round(float(np.percentile(lats, 99)), 2),
+        "p99_ms": round(p99, 2),
         "mean_ms": round(float(np.mean(lats)), 2),
-        "p99_target_ms": P99_TARGET_MS,
-        "p99_target_met": float(np.percentile(lats, 99)) <= P99_TARGET_MS,
-        "pct_exceeding_target": round(
-            100 * sum(1 for l in lats if l > P99_TARGET_MS) / len(lats), 1
-        ),
+        "p99_target_ms": P99_LATENCY_TARGET_MS,
+        "p99_target_met": p99 <= P99_LATENCY_TARGET_MS,
+        "pct_exceeding_target": round(100 * sum(1 for x in lats if x > P99_LATENCY_TARGET_MS) / len(lats), 1),
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.serving.serve:app", host="0.0.0.0", port=8000, reload=False)
+
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run("src.serving.serve:app", host=os.environ.get("HOST", "0.0.0.0"),
+                port=int(os.environ.get("PORT", "8000")), reload=False)

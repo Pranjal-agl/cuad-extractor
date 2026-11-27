@@ -31,24 +31,19 @@ Or check online/offline gap after labelling some production examples:
 
 import json
 import math
-import sys
-import time
-from collections import defaultdict, deque
+import os
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-ROOT = Path(__file__).parent.parent.parent
-DATA_DIR = ROOT / "data"
-EXPERIMENTS_DIR = ROOT / "experiments"
+from src.config import CLAUSE_TYPES, DATA_DIR, EXPERIMENTS_DIR
+
 LOG_PATH = DATA_DIR / "production_log.jsonl"
 LABELS_PATH = DATA_DIR / "production_labels.jsonl"
-
-CLAUSE_TYPES = [
-    "Governing Law", "Termination For Convenience", "Renewal Term",
-    "Non-Compete", "Confidentiality Of Agreements", "Indemnification",
-    "Cap On Liability", "Assignment",
-]
+# Store a short prefix of the input and of each predicted span so a human
+# can judge predictions in --label. Set to 0 if contract text must not be
+# persisted.
+SNIPPET_CHARS = int(os.environ.get("CUAD_LOG_SNIPPET_CHARS", "200"))
 
 
 # ── logging ───────────────────────────────────────────────────────────────────
@@ -59,7 +54,7 @@ def log_prediction(
     clause: str,
     predicted_spans: list[str],
     latency_ms: float,
-    confidence: Optional[float] = None,
+    confidence: float | None = None,
 ) -> None:
     """Append one production prediction to the log."""
     LOG_PATH.parent.mkdir(exist_ok=True)
@@ -67,7 +62,8 @@ def log_prediction(
         "ts": datetime.now(timezone.utc).isoformat(),
         "clause": clause,
         "text_len": len(text),
-        "text_prefix": text[:50],
+        "text_prefix": text[:SNIPPET_CHARS],
+        "predicted_spans": [sp[:SNIPPET_CHARS] for sp in predicted_spans] if SNIPPET_CHARS else [],
         "n_spans_predicted": len(predicted_spans),
         "has_prediction": len(predicted_spans) > 0,
         "latency_ms": round(latency_ms, 2),
@@ -87,7 +83,7 @@ def label_session(max_cases: int = 20) -> None:
         return
 
     with open(LOG_PATH) as f:
-        log = [json.loads(l) for l in f if l.strip()]
+        log = [json.loads(line) for line in f if line.strip()]
 
     existing = set()
     if LABELS_PATH.exists():
@@ -108,7 +104,9 @@ def label_session(max_cases: int = 20) -> None:
         for rec in unlabeled:
             print(f"  Clause : {rec['clause']}")
             print(f"  Text   : \"{rec['text_prefix']}...\"")
-            print(f"  Predicted spans: {rec['n_spans_predicted']}")
+            print(f"  Predicted spans ({rec['n_spans_predicted']}):")
+            for sp in rec.get("predicted_spans", []):
+                print(f"    - \"{sp}\"")
             ans = input("  Was prediction correct? [y/n/skip]: ").strip().lower()
             if ans in ("s", "skip", ""):
                 print()
@@ -151,13 +149,13 @@ def drift_report(baseline_path: Path, window: int = 200) -> None:
         return
 
     with open(LOG_PATH) as f:
-        log = [json.loads(l) for l in f if l.strip()]
+        log = [json.loads(line) for line in f if line.strip()]
 
     recent = log[-window:]
     n = len(recent)
 
     print(f"\n{'='*60}")
-    print(f"  Drift Report")
+    print("  Drift Report")
     print(f"  Baseline  : {baseline_path.name}")
     print(f"  Window    : last {n} predictions")
     print(f"{'='*60}\n")
@@ -217,19 +215,20 @@ def drift_report(baseline_path: Path, window: int = 200) -> None:
     # 4. Online accuracy (if labels exist)
     if LABELS_PATH.exists():
         with open(LABELS_PATH) as f:
-            labels = [json.loads(l) for l in f if l.strip()]
+            labels = [json.loads(line) for line in f if line.strip()]
         if labels:
-            correct = sum(1 for l in labels if l["correct"])
+            correct = sum(1 for rec in labels if rec["correct"])
             online_acc = correct / len(labels)
             baseline_f1 = baseline.get("macro_f1") if baseline_path.exists() else None
             gap_str = ""
             if baseline_f1:
                 gap = online_acc - baseline_f1
                 flag = "  GAP" if abs(gap) > 0.1 else ""
-                gap_str = f"  offline={baseline_f1:.4f}  gap={gap:+.4f}{flag}"
+                # Approximate: human "correct" judgements vs offline mean span F1.
+                gap_str = f"  offline macro F1={baseline_f1:.4f}  gap={gap:+.4f}{flag}"
             print(f"\n  Online accuracy: {correct}/{len(labels)} ({online_acc:.2%}){gap_str}")
     else:
-        print(f"\n  No labels yet. Run --label to add ground truth.")
+        print("\n  No labels yet. Run --label to add ground truth.")
 
     print()
 
@@ -242,7 +241,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--label", action="store_true")
-    parser.add_argument("--baseline", default="experiments/eval_test_fp32.json")
+    parser.add_argument("--baseline", default=str(EXPERIMENTS_DIR / "eval_test_fp32.json"))
     parser.add_argument("--window", type=int, default=200)
     parser.add_argument("--n", type=int, default=20)
     args = parser.parse_args()

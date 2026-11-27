@@ -1,81 +1,69 @@
 # CUAD Clause Extractor
 
-Fine-tuned DeBERTa-v3-base for extractive clause identification from legal contracts. Given a contract paragraph, the model identifies and extracts text spans for 8 clause types: Governing Law, Termination For Convenience, Renewal Term, Non-Compete, Confidentiality, Indemnification, Cap On Liability, and Assignment.
+[![CI](https://github.com/Pranjal-agl/cuad-extractor/actions/workflows/ci.yml/badge.svg)](https://github.com/Pranjal-agl/cuad-extractor/actions/workflows/ci.yml)
 
-Built to cover what a pure agentic pipeline cannot: model ownership, quantization with a measured accuracy/latency tradeoff, validation-driven hyperparameter search tracked in MLflow, and a p99 latency target verified under load.
+Fine-tuned DeBERTa-v3-base for extractive clause identification in legal contracts. Given contract text of any length, the model tags character spans for 8 CUAD clause types — **Governing Law, Termination For Convenience, Renewal Term, Non-Compete, Cap On Liability, Anti-Assignment, Audit Rights, Exclusivity** — in a single pass, each with a confidence score.
+
+Built to cover what a pure agentic pipeline cannot: model ownership, quantization with a measured accuracy/latency trade-off, validation-driven hyperparameter search tracked in MLflow, and a p99 latency target verified under load.
 
 ---
 
 ## Results
 
-| Metric | FP32 | 4-bit Quantized |
-|---|---|---|
-| Test macro F1 | 0.7747 | N/A (see note below) |
-| Val macro F1 (best config) | 0.4318 | N/A |
-| Overfit gap (test − val) | +0.3429 | N/A |
-| p99 latency | 29.1ms | N/A |
-| Model size | 711.9MB | N/A |
-| Adversarial pass rate | 50% (2/4) | N/A |
-| Latency speedup (4-bit vs FP32) | N/A | N/A |
+> **Status:** the numbers below come from the 27 Jul 2026 Kaggle run of the *first* version of this pipeline (`notebooks/kaggle_train.ipynb`). Review of that version found bugs that affect how they should be read (next section). The fixes are in the code; the notebook needs a re-run to produce numbers for the current pipeline.
 
-**Note on quantization:** 4-bit NF4 quantization is implemented (`src/training/quantize.py`) but currently fails at load time due to a long-standing upstream bug in `transformers`' bitsandbytes integration (`from_pretrained` with `quantization_config` calls `dispatch_model()`, which calls `model.to()` on an already-quantized model — disallowed by bitsandbytes). This is reported against multiple `transformers` versions over an extended period (see [huggingface/transformers#35442](https://github.com/huggingface/transformers/issues/35442), [#38717](https://github.com/huggingface/transformers/issues/38717)), not something fixed by pinning a different version. `quantize.py` degrades gracefully: it still reports full FP32 results and records the quantization failure rather than crashing. Revisiting this is a known follow-up, not a blocker for the rest of the pipeline.
-
-**Note on the val/test F1 gap:** test F1 (0.77) is notably *higher* than val F1 (0.43) — the reverse of typical overfitting. This is most likely a small-sample effect: val has only 233 examples across 5 clause types with different per-clause proportions than test (269 examples), and `Governing Law` — the easiest clause type (F1=0.97) — happens to be a larger share of test. Treat both numbers as noisy estimates from small splits rather than a precise generalization gap.
-
-### Per-clause F1 (test set)
-
-| Clause | F1 | 95% CI |
-|---|---|---|
-| Governing Law | 0.973 | [0.920, 0.997] |
-| Renewal Term | 0.764 | [0.744, 0.965] |
-| Non-Compete | 0.754 | [0.719, 0.962] |
-| Cap On Liability | 0.729 | [0.693, 0.847] |
-| Termination For Convenience | 0.655 | [0.589, 0.863] |
-
-### Adversarial eval (test set)
-
-| Case | Result |
+| Metric (27 Jul run) | FP32 |
 |---|---|
-| no_clause_present | PASS (F1=1.000) |
-| boilerplate_noise | PASS (F1=1.000) |
-| truncated_context | FAIL (F1=0.468) |
-| multiple_spans | FAIL (F1=0.338) |
+| Test macro F1 (span-level, 5 clause types) | 0.7747 |
+| Val macro F1 reported at selection (token-level, ÷8) | 0.4318 |
+| p99 latency (single window, T4) | 29.1 ms |
+| Model size | 711.9 MB |
+| Adversarial pass rate | 50% (2/4) |
 
-The model handles negative cases (no clause present, distracting boilerplate) cleanly, but degrades meaningfully when a contract has more than one span for the same clause type, or when context is cut short — both realistic contract patterns, not synthetic edge cases.
-
-### Ablation: which components matter
-
-| Config | Val F1 | Notes |
+| Clause (test) | F1 | n |
 |---|---|---|
-| Best: lr=2e-5, bs=8, ep=3 | 0.4318 | Selected config |
-| lr=1e-5, bs=8, ep=3 | 0.2344 | Underfit |
-| lr=1e-5, bs=8, ep=5 | 0.4281 | More epochs closes most of the gap to the best config |
-| lr=2e-5, bs=16, ep=3 | 0.3396 | Larger batch, same LR — worse than bs=8 |
-| lr=5e-6, bs=8, ep=5 | 0.3181 | Too conservative even with more epochs |
-| lr=3e-5, bs=8, ep=2 | 0.4025 | Highest LR tested, competitive despite fewer epochs |
+| Governing Law | 0.973 | 67 |
+| Renewal Term | 0.764 | 30 |
+| Non-Compete | 0.754 | 27 |
+| Cap On Liability | 0.729 | 109 |
+| Termination For Convenience | 0.655 | 36 |
+
+The original table also had "95% CIs". Those were Wilson intervals for *the fraction of examples with F1 > 0.5*, not for F1, so they're omitted here. The current code reports bootstrap CIs of mean F1.
+
+### What the review found in that run
+
+1. **Only 5 of the 8 clause types had any data.** `prepare_data.py` asked for "Confidentiality Of Agreements", "Indemnification" and "Assignment", which are not CUAD category names, so they matched nothing. Meanwhile `train.py`, `evaluate.py`, `serve.py` and `monitor.py` each kept *different* clause lists. Now there is one list in `src/config.py`, using real CUAD names, and `prepare_data` aborts if any configured type yields zero examples.
+2. **The "test F1 is higher than val F1" gap was a metric artifact, not sampling noise.** Val F1 (used for model selection) was token-level and averaged over all 8 configured clauses, including the 3 with no data (F1 = 0). Test F1 was span-level and averaged over the 5 present clauses. 0.4318 × 8/5 = 0.691. Now the same span-level metric is used for selection, for val and for test, and `evaluate.py --split test` reports `test − val` on identical footing.
+3. **Every example was positive.** The model never saw a window *without* the clause it was asked about, so "no clause here" was barely tested. Now negative windows are sampled from contracts that lack the clause (CUAD reviewers labelled every contract for every category).
+4. **Other clauses inside a window were labelled `O`.** Each window only labelled its anchor annotation. A second Governing Law sentence, or a Cap On Liability clause in the same window, was taught as "not a clause". Now every annotation overlapping a window is labelled.
+5. **Truncation.** Text past 384/512 tokens was dropped at train *and* inference time. Labels for spans crossing the cut were lost entirely, and the API couldn't see clauses beyond the first ~2 pages. Now training and inference both use overlapping sliding windows (384 tokens, 128 stride), and predictions are merged across windows.
+6. **Train/inference mismatch.** Training used 384-token windows, while evaluation and serving used 512.
+7. **Offsets were off by a few characters.** `context.strip()` and `answer.strip()` were applied without adjusting `start_in_context`. Offsets are now trimmed instead of the text.
+8. **Over-correction for class imbalance.** Inverse-frequency weights fixed the all-`O` collapse, but the model then predicted 2.3× more clause tokens than exist (34,335 vs 14,946 on val), and precision trails recall on every clause. The grid now includes a `sqrt_inverse` weighting run as an ablation.
+9. **Two adversarial "failures" were wrong gold labels.** CUAD annotators mark whole clause sentences, but the cases expected short phrases ("laws of California"), so a correct full-sentence prediction scored F1 0.47. The cases now follow the CUAD convention. Two new cases were added: a wrong-clause query, and a clause that only appears after the first window.
 
 ---
 
 ## Architecture
 
 ```
-Contract paragraph (raw text)
+Contract text (any length)
         |
         v
-DeBERTa-v3-base tokenizer (512 token max, truncation)
+DeBERTa-v3 tokenizer -> overlapping windows (384 tokens, stride 128)
         |
         v
-DeBERTa-v3-base encoder (fine-tuned)
+DeBERTa-v3-base encoder + token classification head
+(17 labels: O + B/I for 8 clause types; batched over windows)
         |
         v
-Token classification head (17 labels: O + B/I for 8 clause types)
+BIO decoding per window (lenient: orphan I- starts a span)
         |
         v
-BIO span extraction -> clause spans
+Merge overlapping spans across windows -> {clause, start, end, text, score}
 ```
 
-One model handles all 8 clause types simultaneously via multi-class BIO tagging.
-This avoids 8 separate forward passes per contract.
+One forward pass per window produces every clause type at once. The original server ran the model once per requested clause type, up to 8× the work. The same `ClauseExtractor` (`src/inference.py`) is used by validation during training, evaluation, quantization and serving, so every number is produced the same way.
 
 ---
 
@@ -83,20 +71,21 @@ This avoids 8 separate forward passes per contract.
 
 | Requirement | Implementation |
 |---|---|
-| Held-out eval, no leakage | Contract-level split, splits.lock fingerprint |
-| Reproducible runs | seed=42 everywhere, MLflow logs all params |
-| Ablations isolating component contribution | 6-config grid search, all logged to MLflow |
-| Validation-driven hyperparameter search | Grid search on val F1, test set touched once |
-| Honest overfit check | Val F1 vs test F1 reported side by side |
-| Quantization with tradeoff measured | bitsandbytes 4-bit NF4, F1 drop + speedup in report |
-| p99 latency target | 150ms target, measured on 100 timing runs + load test |
-| Cost-per-request awareness | Latency * compute cost tracked in quantization report |
-| Slice and adversarial evals | Per-clause F1 + 4 adversarial cases |
-| Confidence intervals | 95% Wilson CI per clause on test set |
-| Drift detection | monitor.py tracks prediction rate + confidence + latency drift |
-| Online/offline metric gap | label_session() + drift_report() measures online F1 |
-| Graceful degradation | Serving returns empty spans + error flag, never 500 |
-| Model card | MODEL_CARD.md with known limitations and reproduction steps |
+| Held-out eval, no leakage | Contract-level split; `splits.lock` fingerprints test contracts **and** test examples and clause list |
+| Reproducible runs | seed=42 everywhere (incl. data loader), MLflow logs params + git commit |
+| Ablations isolating component contribution | 7-config grid incl. class-weighting ablation, all logged to MLflow |
+| Validation-driven hyperparameter search | Selection on span-level val macro F1, test touched once |
+| Honest overfit check | `evaluate.py --split test` scores val with the same metric and reports `test − val` |
+| Quantization with trade-off measured | INT8 dynamic (CPU) vs FP32-on-CPU; NF4 4-bit (GPU) vs FP32-on-GPU; F1 drop, p99 speedup, size |
+| p99 latency target | 150 ms; measured after warm-up in eval, quantization and the load test |
+| Slice and adversarial evals | Per-clause F1 on positives, false-positive rate on negatives, 6 adversarial cases |
+| Confidence intervals | 95% bootstrap CI of mean F1 per clause; Wilson CI for hit rate |
+| Calibration | Reliability table + ECE of span confidence scores (`src/eval/calibration.py`) |
+| Drift detection | `monitor.py`: prediction rate, text length, latency drift; server logs when `CUAD_LOG_PREDICTIONS=1` |
+| Online/offline metric gap | `monitor.py --label` (shows predicted spans) + `--report` |
+| Graceful degradation | Inference errors return empty spans + error flag, never a 500 |
+| Tests / CI | `pytest` (35 tests, tiny local model, no downloads) + `ruff` on GitHub Actions |
+| Model card | `MODEL_CARD.md` |
 
 ---
 
@@ -105,79 +94,65 @@ This avoids 8 separate forward passes per contract.
 ```bash
 git clone https://github.com/Pranjal-agl/cuad-extractor
 cd cuad-extractor
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt        # add -dev for pytest/ruff
 ```
 
-GPU recommended (Colab T4 or Kaggle). Training on CPU is slow but works for testing.
-
-See `notebooks/kaggle_train.ipynb` for the full training run with real outputs (data prep, 6-config hyperparameter search, quantization, evaluation, calibration).
-
----
+A GPU is recommended for training (Kaggle T4 / Colab). Serving and evaluation run fine on CPU, and `CUAD_QUANTIZE=int8` makes CPU serving faster. `notebooks/kaggle_train.ipynb` runs the whole pipeline on Kaggle.
 
 ## Running
 
-### 1. Prepare data
 ```bash
-python -m src.training.prepare_data
-```
-Downloads CUAD from HuggingFace, selects 8 clause types, creates contract-level
-train/val/test splits, writes splits.lock to prevent test set contamination.
+# 1. Data: CUAD from HuggingFace -> data/{train,val,test}.jsonl + splits.lock
+python -m src.training.prepare_data                 # --neg-ratio 0 to disable negatives
 
-### 2. Train with hyperparameter search
-```bash
-python -m src.training.train
-```
-Runs 6 configurations, logs all to MLflow, saves best checkpoint to models/.
-Takes 2-6 hours on a T4 depending on config.
+# 2. Train: grid search, everything logged to MLflow
+python -m src.training.train                        # --configs 3,7  --prune
+mlflow ui --backend-store-uri sqlite:///experiments/mlflow.db
 
-View experiment results:
-```bash
-mlflow ui --backend-store-uri experiments/mlruns
-```
+# 3. Quantization trade-off -> experiments/quantization_report.json
+python -m src.training.quantize                     # --schemes int8,nf4
 
-### 3. Quantize
-```bash
-python -m src.training.quantize
-```
-Loads best checkpoint, applies 4-bit NF4 quantization, measures F1 drop and
-latency gain vs FP32, writes report to experiments/quantization_report.json.
+# 4. Evaluate once, after selection is final -> experiments/eval_test_<tag>.json
+python -m src.eval.evaluate --split test            # --quantize int8|nf4
+python -m src.eval.calibration --eval-file experiments/eval_test_fp32.json
 
-### 4. Evaluate on test set
-```bash
-# Run once, after hyperparameter selection is final
-python -m src.eval.evaluate --split test
+# 5. Serve
+python -m src.serving.serve                         # env: CUAD_QUANTIZE, CUAD_MODEL_PATH, ...
 
-# With quantized model
-python -m src.eval.evaluate --split test --quantized
-```
-
-### 5. Serve
-```bash
-python -m src.serving.serve
-```
-
-Test it:
-```bash
-curl -X POST http://localhost:8000/extract \
-  -H "Content-Type: application/json" \
-  -d '{"text": "This Agreement is governed by the laws of Delaware.", "clause_types": ["Governing Law"]}'
-```
-
-### 6. Load test
-```bash
+# 6. Load test (server must be running)
 python -m src.serving.load_test --concurrency 4 --n-requests 200
-```
 
-### 7. Monitor drift
-```bash
-# After processing real contracts through the API
-python -m src.eval.monitor --report --baseline experiments/eval_test_fp32.json
-
-# Label production predictions for online F1 tracking
+# 7. Monitoring (serve with CUAD_LOG_PREDICTIONS=1)
 python -m src.eval.monitor --label
+python -m src.eval.monitor --report
 ```
+
+### API
+
+```bash
+curl -X POST http://localhost:8000/extract -H "Content-Type: application/json" \
+  -d '{"text": "This Agreement is governed by the laws of Delaware.", "clause_types": ["Governing Law"], "min_score": 0.5}'
+```
+
+```json
+{
+  "clauses": {"Governing Law": ["This Agreement is governed by the laws of Delaware."]},
+  "spans":   {"Governing Law": [{"text": "This Agreement is governed by the laws of Delaware.", "start": 0, "end": 51, "score": 0.93}]},
+  "latency_ms": 24.1, "n_windows": 1, "p99_exceeded": false, "error": null
+}
+```
+
+`clauses` keeps the original response shape. `spans` adds character offsets and confidence. Also available: `GET /clauses`, `GET /health` and `GET /metrics`. Configuration (all optional) is listed in `.env.example`.
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest && ruff check .
+```
+
+The tests build a tiny random BERT token classifier with the project's label set. They run inference, sliding windows, INT8 quantization, the NF4 load workaround and the FastAPI app end-to-end on CPU in a few seconds, with no model download.
 
 ---
 
@@ -186,43 +161,45 @@ python -m src.eval.monitor --label
 ```
 cuad-extractor/
 ├── src/
+│   ├── config.py              # clause types, label map, window size, paths, MLflow store
+│   ├── spans.py               # BIO labelling/decoding, span merge, span & token F1 (pure Python)
+│   ├── metrics.py             # bootstrap/Wilson CIs, latency summary, calibration (ECE)
+│   ├── inference.py           # ClauseExtractor: sliding windows, one pass, scores, int8/nf4 loading
 │   ├── training/
-│   │   ├── prepare_data.py    # CUAD download, contract-level splits, splits.lock
-│   │   ├── train.py           # Fine-tuning with MLflow tracking, 6-config grid search
-│   │   └── quantize.py        # 4-bit NF4 quantization, F1/latency tradeoff report
+│   │   ├── prepare_data.py    # CUAD download, multi-span labels, negatives, contract-level splits, lock
+│   │   ├── train.py           # fine-tuning + grid search, span-level val selection, MLflow
+│   │   └── quantize.py        # INT8 (CPU) and NF4 (GPU) trade-off report
 │   ├── eval/
-│   │   ├── evaluate.py        # Test set eval, per-clause F1, CI, adversarial cases
-│   │   └── monitor.py         # Production drift monitoring, online accuracy tracking
+│   │   ├── evaluate.py        # per-clause F1 + CIs, negatives, calibration, adversarial, val/test gap
+│   │   ├── calibration.py     # reliability table from an eval report
+│   │   └── monitor.py         # production drift + online labelling
 │   └── serving/
-│       ├── serve.py           # FastAPI endpoint, rolling latency window, /health /metrics
-│       └── load_test.py       # Async load test, p99 under concurrency
-├── data/                      # JSONL splits + splits.lock (git-ignored)
-├── models/                    # Checkpoints + best_config.json (git-ignored)
-├── experiments/               # Eval reports, quantization report, load test report
+│       ├── serve.py           # FastAPI app
+│       └── load_test.py       # async load test
+├── tests/                     # pytest suite (tiny local model, no downloads)
+├── notebooks/kaggle_train.ipynb
+├── .github/workflows/ci.yml
 ├── MODEL_CARD.md
-├── requirements.txt
-└── README.md
+└── requirements.txt / requirements-dev.txt / pyproject.toml
 ```
-
----
 
 ---
 
 ## Known issues & debugging notes
 
-Training initially produced NaN loss and, once fixed, a model that collapsed to predicting the majority "O" class. Both were root-caused and fixed rather than worked around:
-
-- **NaN loss from epoch 1:** `AdamW`'s default `eps=1e-8` is too small for DeBERTa-v3's gradient-disentangled embedding sharing, which produces very small early gradients; the adaptive step size spiked. Fixed with `eps=1e-6` in `train.py`.
-- **val_macro_f1 stuck at 0.0000:** confirmed via diagnostic instrumentation that the model predicted zero non-"O" tokens across multiple epochs despite loss decreasing — a majority-class collapse caused by unweighted cross-entropy on a heavily imbalanced label distribution (clause spans are a small minority of tokens). Fixed with inverse-frequency class-weighted loss in `train.py`.
-- **4-bit quantization crash:** see the Results section above — this remains open, degrades gracefully, does not block the rest of the pipeline.
+- **NaN loss from epoch 1:** AdamW's default `eps=1e-8` is too small for DeBERTa-v3's gradient-disentangled embedding sharing. Fixed with `eps=1e-6`. Batches with non-finite loss or gradients are skipped and counted in MLflow.
+- **Collapse to all-`O`:** fixed with class-weighted loss (see point 8 above for the over-correction and its ablation).
+- **4-bit NF4 load crash — root cause found.** It's not a long-standing upstream bug. It's a version interaction: `accelerate` ≥ 0.33 assumes 4-bit bitsandbytes models can be moved (true since bitsandbytes 0.43.2), so for a single-GPU device map it ends with `model.to(device)`. The pinned `transformers==4.44.2` still rejects `.to()` on *every* bitsandbytes model, which is exactly the error in the notebook. `src/inference.allow_noop_to_for_bnb` permits only no-op moves during loading; real moves still raise. This is unit-tested on CPU, but the end-to-end NF4 path still needs a GPU run to confirm. Meanwhile INT8 dynamic quantization gives a working CPU option.
+- **`transformers` pin:** kept at 4.44.2 because that's the version the reported run was trained with. Upgrading would also remove the need for the NF4 workaround above.
 
 ## Stack
 
 | Component | Technology |
 |---|---|
-| Base model | microsoft/deberta-v3-base |
-| Fine-tuning | HuggingFace Transformers (pinned 4.44.2) + PyTorch |
-| Quantization | bitsandbytes 4-bit NF4 (currently blocked, see Known Issues) |
-| Experiment tracking | MLflow |
+| Base model | microsoft/deberta-v3-base (override with `CUAD_BASE_MODEL`) |
+| Fine-tuning | HuggingFace Transformers 4.44.2 + PyTorch |
+| Quantization | PyTorch dynamic INT8 (CPU); bitsandbytes NF4 (GPU) |
+| Experiment tracking | MLflow (SQLite store in `experiments/`) |
 | Serving | FastAPI + uvicorn |
-| Dataset | CUAD (theatticusproject/cuad-qa) |
+| Dataset | CUAD v1 via `dvgodoy/CUAD_v1_Contract_Understanding_{clause_classification,PDF}` |
+| CI | GitHub Actions: ruff + pytest |
